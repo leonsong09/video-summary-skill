@@ -19,6 +19,7 @@ Fallback chain:
 import glob
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -31,11 +32,28 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from functools import reduce
 
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
+    # Add CUDA 12 DLL paths to PATH for GPU acceleration
+    try:
+        import site
+        for site_packages in site.getsitepackages():
+            cuda_paths = [
+                os.path.join(site_packages, "nvidia", "cublas", "bin"),
+                os.path.join(site_packages, "nvidia", "cudnn", "bin"),
+                os.path.join(site_packages, "nvidia", "cuda_nvrtc", "bin"),
+                os.path.join(site_packages, "nvidia", "cuda_runtime", "bin"),
+            ]
+            for cuda_path in cuda_paths:
+                if os.path.exists(cuda_path) and cuda_path not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = cuda_path + os.pathsep + os.environ.get("PATH", "")
+    except Exception:
+        pass  # Silently ignore if CUDA paths not found
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
@@ -1389,15 +1407,37 @@ def transcribe_with_whisper(url, platform, info, config, play_url=None):
                 log("Failed to download audio", "ERROR")
             return None
 
+        text = None
+        segments = []
+
         if whisper_mode == "api":
             text = _whisper_api(audio_path, config)
         elif whisper_mode == "local":
-            text = _whisper_local(audio_path, config)
+            text, segments = _whisper_local(audio_path, config)
         else:
             log(f"Unknown whisper_mode: {whisper_mode}", "ERROR")
             return None
 
         if text:
+            # Generate SRT file if enabled
+            if config.get("generate_srt", False) and segments:
+                srt_dir = config.get("srt_output_dir", "subtitles")
+                if not os.path.isabs(srt_dir):
+                    srt_dir = os.path.join(SCRIPT_DIR, srt_dir)
+
+                # Use video title or URL hash as filename
+                video_title = info.get("title", "")
+                if video_title:
+                    # Sanitize filename
+                    safe_title = re.sub(r'[<>:"/\\|?*]', '_', video_title)[:100]
+                    srt_filename = f"{safe_title}.srt"
+                else:
+                    url_hash = _cache_key(url)
+                    srt_filename = f"{url_hash}.srt"
+
+                srt_path = os.path.join(srt_dir, srt_filename)
+                _generate_srt(segments, srt_path)
+
             source = f"whisper_{whisper_mode}"
             return _make_result(info, platform, url, text, source)
     finally:
@@ -1476,26 +1516,241 @@ def _whisper_api_chunked(audio_path, client, language):
         return None
 
 
+def _format_srt_timestamp(seconds):
+    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _generate_srt(segments, output_path):
+    """Generate SRT subtitle file from segments.
+
+    Args:
+        segments: List of dicts with 'text', 'start', 'end' keys
+        output_path: Path to save the SRT file
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            for i, seg in enumerate(segments, start=1):
+                start_time = _format_srt_timestamp(seg["start"])
+                end_time = _format_srt_timestamp(seg["end"])
+                text = seg["text"].strip()
+
+                f.write(f"{i}\n")
+                f.write(f"{start_time} --> {end_time}\n")
+                f.write(f"{text}\n\n")
+
+        log(f"SRT file generated: {output_path}")
+        return True
+    except Exception as e:
+        log(f"Failed to generate SRT file: {e}", "ERROR")
+        return False
+
+
+def _volcengine_asr(audio_path, config):
+    """Transcribe using Volcano Engine Speech Recognition API."""
+    appid = config.get("volcengine_appid", "")
+    token = config.get("volcengine_token", "")
+    language = config.get("volcengine_language", "zh-CN")
+
+    if not appid or not token:
+        log("volcengine_appid and volcengine_token must be configured in config.json", "ERROR")
+        return None, []
+
+    # Split token into access_key and secret_key (format: "access_key:secret_key")
+    if ":" in token:
+        access_key, secret_key = token.split(":", 1)
+    else:
+        log("volcengine_token format should be 'access_key:secret_key'", "ERROR")
+        return None, []
+
+    try:
+        # Read audio file
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+
+        # Prepare request
+        url = "https://openspeech.bytedance.com/api/v1/asr"
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Date": timestamp,
+        }
+
+        payload = {
+            "app": {
+                "appid": appid,
+                "token": "access_token",
+                "cluster": "volcano_asr"
+            },
+            "user": {
+                "uid": "user_001"
+            },
+            "audio": {
+                "format": "wav",
+                "rate": 16000,
+                "bits": 16,
+                "channel": 1,
+                "language": language
+            },
+            "request": {
+                "reqid": hashlib.md5(str(time.time()).encode()).hexdigest(),
+                "nbest": 1,
+                "word_info": 1,
+                "result_type": "full"
+            }
+        }
+
+        payload_json = json.dumps(payload)
+
+        # Sign request
+        query_params = {}
+        authorization = _sign_volcengine_request("POST", "/api/v1/asr", query_params, headers, payload_json, access_key, secret_key)
+        headers["Authorization"] = authorization
+
+        # Make request
+        req = urllib.request.Request(url, data=payload_json.encode(), headers=headers, method="POST")
+
+        with urllib.request.urlopen(req, timeout=300) as response:
+            result = json.loads(response.read().decode())
+
+        if result.get("code") != 0:
+            error_msg = result.get("message", "Unknown error")
+            log(f"Volcano Engine ASR failed: {error_msg}", "ERROR")
+            return None, []
+
+        # Parse results
+        segments = []
+        lines = []
+
+        for utterance in result.get("result", []):
+            text = utterance.get("text", "").strip()
+            start_time = utterance.get("start_time", 0) / 1000.0  # Convert ms to seconds
+            end_time = utterance.get("end_time", 0) / 1000.0
+
+            if text:
+                segments.append({
+                    "text": text,
+                    "start": start_time,
+                    "end": end_time
+                })
+                lines.append(text)
+
+        if not lines:
+            return None, []
+
+        return "\n".join(lines), segments
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        log(f"Volcano Engine API HTTP error: {e.code} {e.reason}\n{error_body}", "ERROR")
+        return None, []
+    except Exception as e:
+        log(f"Volcano Engine ASR failed: {e}", "ERROR")
+        return None, []
+
+
+def _sign_volcengine_request(method, uri, query_params, headers, payload, access_key, secret_key):
+    """Generate AWS Signature Version 4 for Volcano Engine API."""
+    # Step 1: Create canonical request
+    canonical_uri = uri
+    canonical_querystring = "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(str(v), safe='')}"
+        for k, v in sorted(query_params.items())
+    )
+
+    canonical_headers = "\n".join(
+        f"{k.lower()}:{v.strip()}" for k, v in sorted(headers.items())
+    ) + "\n"
+
+    signed_headers = ";".join(sorted(k.lower() for k in headers.keys()))
+
+    payload_hash = hashlib.sha256(payload.encode() if isinstance(payload, str) else payload).hexdigest()
+
+    canonical_request = f"{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+    # Step 2: Create string to sign
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{headers['X-Date'][:8]}/cn-north-1/sami/request"
+    string_to_sign = f"{algorithm}\n{headers['X-Date']}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+
+    # Step 3: Calculate signature
+    k_date = hmac.new(f"AWS4{secret_key}".encode(), headers['X-Date'][:8].encode(), hashlib.sha256).digest()
+    k_region = hmac.new(k_date, b"cn-north-1", hashlib.sha256).digest()
+    k_service = hmac.new(k_region, b"sami", hashlib.sha256).digest()
+    k_signing = hmac.new(k_service, b"request", hashlib.sha256).digest()
+    signature = hmac.new(k_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+    # Step 4: Add authorization header
+    authorization = f"{algorithm} Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+
+    return authorization
+
+
 def _whisper_local(audio_path, config):
     """Transcribe using faster-whisper (local model)."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         log("faster-whisper not installed. Run: pip install faster-whisper", "ERROR")
-        return None
+        return None, []
+
+    # Add CUDA DLL directories for Windows GPU acceleration
+    if sys.platform == "win32":
+        try:
+            import site
+            for site_packages in site.getsitepackages():
+                cuda_bin_dirs = [
+                    os.path.join(site_packages, "nvidia", "cublas", "bin"),
+                    os.path.join(site_packages, "nvidia", "cudnn", "bin"),
+                    os.path.join(site_packages, "nvidia", "cuda_nvrtc", "bin"),
+                    os.path.join(site_packages, "nvidia", "cuda_runtime", "bin"),
+                ]
+                for cuda_dir in cuda_bin_dirs:
+                    if os.path.exists(cuda_dir):
+                        os.add_dll_directory(cuda_dir)
+        except (AttributeError, Exception):
+            pass  # os.add_dll_directory not available or failed
 
     model_size = config.get("whisper_model", "base")
+    device = config.get("whisper_device", "auto")
+    compute_type = config.get("whisper_compute_type", "auto")
     language = config.get("language", "zh")
-    log(f"Loading Whisper model '{model_size}'...")
+    log(f"Loading Whisper model '{model_size}' on device '{device}' with compute_type '{compute_type}'...")
 
     try:
-        model = WhisperModel(model_size, device="auto", compute_type="auto")
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
         segments, _ = model.transcribe(audio_path, language=language)
-        lines = [seg.text.strip() for seg in segments if seg.text.strip()]
-        return "\n".join(lines) if lines else None
+
+        # Collect segments with timestamps
+        segment_list = []
+        lines = []
+        for seg in segments:
+            text = seg.text.strip()
+            if text:
+                segment_list.append({
+                    "text": text,
+                    "start": seg.start,
+                    "end": seg.end
+                })
+                lines.append(text)
+
+        if not lines:
+            return None, []
+
+        return "\n".join(lines), segment_list
     except Exception as e:
         log(f"Local Whisper transcription failed: {e}", "ERROR")
-        return None
+        return None, []
 
 
 # ---------------------------------------------------------------------------
@@ -1625,22 +1880,145 @@ def _clear_cache():
     log(f"Cleared cache: {removed} files removed")
 
 
+def extract_local_video(file_path, config):
+    """Extract subtitles from a local video file using ASR."""
+    if not os.path.exists(file_path):
+        return {"error": f"File not found: {file_path}"}
+
+    log(f"Processing local video: {file_path}")
+
+    # Get video info using ffmpeg
+    info = {"title": os.path.basename(file_path), "author": "", "duration": 0, "description": ""}
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            info["duration"] = int(float(result.stdout.strip()))
+    except Exception as e:
+        log(f"Could not get video duration: {e}", "WARN")
+
+    # Extract audio and transcribe
+    tmp_dir = tempfile.mkdtemp(prefix="local_video_")
+    try:
+        audio_path = os.path.join(tmp_dir, "audio.wav")
+        log("Extracting audio from local video...")
+
+        cmd = ["ffmpeg", "-i", file_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path, "-y"]
+        subprocess.run(cmd, capture_output=True, check=True, timeout=300)
+
+        if not os.path.exists(audio_path):
+            return {"error": "Failed to extract audio from video"}
+
+        # Determine ASR engine
+        asr_engine = config.get("asr_engine", "whisper")
+        text = None
+        segments = []
+        source = None
+
+        if asr_engine == "volcengine":
+            text, segments = _volcengine_asr(audio_path, config)
+            source = "volcengine"
+        elif asr_engine == "whisper":
+            whisper_mode = config.get("whisper_mode", "disabled")
+            if whisper_mode == "local":
+                text, segments = _whisper_local(audio_path, config)
+                source = f"whisper_{whisper_mode}"
+            elif whisper_mode == "api":
+                text = _whisper_api(audio_path, config)
+                source = f"whisper_{whisper_mode}"
+            else:
+                return {"error": "Whisper is disabled. Enable it in config.json to transcribe local videos."}
+        elif asr_engine == "auto":
+            # Try Volcano Engine first, fallback to Whisper
+            text, segments = _volcengine_asr(audio_path, config)
+            if text:
+                source = "volcengine"
+            else:
+                log("Volcano Engine failed, falling back to Whisper...")
+                whisper_mode = config.get("whisper_mode", "disabled")
+                if whisper_mode == "local":
+                    text, segments = _whisper_local(audio_path, config)
+                    source = f"whisper_{whisper_mode}"
+                elif whisper_mode == "api":
+                    text = _whisper_api(audio_path, config)
+                    source = f"whisper_{whisper_mode}"
+        else:
+            return {"error": f"Unknown asr_engine: {asr_engine}"}
+
+        if text:
+            # Determine output directory for local video files
+            video_name = os.path.splitext(os.path.basename(file_path))[0]
+            safe_video_name = re.sub(r'[<>:"/\\|?*]', '_', video_name)
+
+            # Check if publish_dir is configured
+            publish_dir = config.get("publish_dir", "")
+            if publish_dir and os.path.isabs(publish_dir):
+                base_dir = publish_dir
+            else:
+                srt_dir = config.get("srt_output_dir", "subtitles")
+                if not os.path.isabs(srt_dir):
+                    srt_dir = os.path.join(SCRIPT_DIR, srt_dir)
+                base_dir = srt_dir
+
+            # Create subfolder for local video
+            video_folder = os.path.join(base_dir, safe_video_name)
+            os.makedirs(video_folder, exist_ok=True)
+
+            # Generate SRT file if enabled
+            if config.get("generate_srt", False) and segments:
+                srt_path = os.path.join(video_folder, f"{safe_video_name}.srt")
+                _generate_srt(segments, srt_path)
+
+            # Extract frames if enabled
+            frames = None
+            if config.get("extract_frames", True):
+                num_frames = config.get("frames_per_video", 6)
+                # Save frames to subfolder's screenshots directory
+                frame_dir = os.path.join(video_folder, "screenshots")
+                frames = _extract_frames_ffmpeg(file_path, frame_dir, num_frames, duration=None)
+
+            result = _make_result(info, "local", file_path, text, source)
+            if frames:
+                result["frames"] = frames
+            return result
+        else:
+            return {"error": "ASR transcription failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"error": "Audio extraction timed out"}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"ffmpeg failed: {e.stderr.decode() if e.stderr else str(e)}"}
+    except Exception as e:
+        return {"error": f"Local video processing failed: {e}"}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--clear-cache":
         _clear_cache()
         return
 
     if len(sys.argv) < 2:
-        print("Usage: python video_subtitle.py <URL>", file=sys.stderr)
+        print("Usage: python video_subtitle.py <URL_or_FILE_PATH>", file=sys.stderr)
         print("       python video_subtitle.py --clear-cache", file=sys.stderr)
-        print("  Supports: Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, and 1800+ sites", file=sys.stderr)
+        print("  Supports: Bilibili, YouTube, Douyin, Xiaohongshu, TikTok, 1800+ sites, and local video files", file=sys.stderr)
         sys.exit(1)
 
-    url = sys.argv[1]
+    input_path = sys.argv[1]
     config = load_config()
 
-    log(f"Extracting subtitles for: {url}")
-    result = extract(url, config)
+    # Check if input is a local file
+    if os.path.exists(input_path) and os.path.isfile(input_path):
+        log(f"Detected local video file: {input_path}")
+        result = extract_local_video(input_path, config)
+    else:
+        log(f"Extracting subtitles for: {input_path}")
+        result = extract(input_path, config)
 
     if not result:
         log("Extraction returned no result", "ERROR")
@@ -1653,7 +2031,7 @@ def main():
         "duration": format_duration(info.get("duration", 0)),
         "description": info.get("description", ""),
         "platform": result.get("platform", "unknown"),
-        "url": result.get("url", url),
+        "url": result.get("url", input_path),
     }
 
     if result.get("error"):
@@ -1671,6 +2049,346 @@ def main():
         ]
 
     print(json.dumps(output, ensure_ascii=False, indent=2))
+
+    # Generate Markdown summary if enabled
+    if config.get("generate_markdown", True):
+        _generate_markdown_summary(output, config)
+
+
+def _generate_markdown_summary(output, config):
+    """Generate detailed Markdown summary file."""
+    if output.get("error") or not output.get("subtitle_text"):
+        return
+
+    # Determine if this is a local video file
+    url = output.get("url", "")
+    is_local = os.path.exists(url) and os.path.isfile(url)
+
+    # Get title
+    title = output.get("title", "video")
+    if not title or title == "video":
+        if is_local:
+            title = os.path.splitext(os.path.basename(url))[0]
+        else:
+            title = "video_summary"
+
+    # Sanitize title for filename
+    safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+
+    # Generate date prefix (YYYYMMDD format)
+    date_prefix = datetime.now().strftime("%Y%m%d")
+    markdown_filename = f"{date_prefix}-{safe_title}.md"
+
+    # Determine output directory
+    if is_local:
+        # For local videos: create subfolder with video name
+        publish_dir = config.get("publish_dir", "")
+        if publish_dir and os.path.isabs(publish_dir):
+            base_dir = publish_dir
+        else:
+            markdown_dir = config.get("markdown_output_dir", "summaries")
+            if not os.path.isabs(markdown_dir):
+                markdown_dir = os.path.join(SCRIPT_DIR, markdown_dir)
+            base_dir = markdown_dir
+
+        # Create subfolder with video name
+        video_folder = os.path.join(base_dir, safe_title)
+        os.makedirs(video_folder, exist_ok=True)
+        markdown_path = os.path.join(video_folder, markdown_filename)
+    else:
+        # For online videos: save directly to publish_dir or markdown_output_dir
+        publish_dir = config.get("publish_dir", "")
+        if publish_dir and os.path.isabs(publish_dir):
+            markdown_dir = publish_dir
+        else:
+            markdown_dir = config.get("markdown_output_dir", "summaries")
+            if not os.path.isabs(markdown_dir):
+                markdown_dir = os.path.join(SCRIPT_DIR, markdown_dir)
+
+        os.makedirs(markdown_dir, exist_ok=True)
+        markdown_path = os.path.join(markdown_dir, markdown_filename)
+
+    style = config.get("markdown_style", "detailed")
+
+    try:
+        with open(markdown_path, "w", encoding="utf-8") as f:
+            # Write header
+            f.write(f"# {title}\n\n")
+            f.write(f"**来源**: {output.get('url', 'N/A')}  \n")
+            f.write(f"**时长**: {output.get('duration', 'N/A')}  \n")
+            f.write(f"**平台**: {output.get('platform', 'unknown')}  \n")
+            if output.get('author'):
+                f.write(f"**作者**: {output['author']}  \n")
+            f.write(f"\n---\n\n")
+
+            subtitle_text = output.get("subtitle_text", "")
+            frames = output.get("frames", [])
+
+            if style == "detailed":
+                _write_detailed_summary(f, subtitle_text, frames, title, output.get('url', ''))
+            else:  # bullet style
+                _write_bullet_summary(f, subtitle_text, frames, title, output.get('url', ''))
+
+        log(f"Markdown summary generated: {markdown_path}")
+    except Exception as e:
+        log(f"Failed to generate Markdown: {e}", "ERROR")
+
+
+def _write_detailed_summary(f, subtitle_text, frames, title, url):
+    """Write detailed paragraph-style summary with AI analysis."""
+    # Split subtitle into logical sections (every ~500 characters or natural breaks)
+    lines = subtitle_text.split('\n')
+    sections = []
+    current_section = []
+    current_length = 0
+
+    for line in lines:
+        current_section.append(line)
+        current_length += len(line)
+        if current_length > 500 or line.endswith(('。', '！', '？', '.', '!', '?')):
+            if current_section:
+                sections.append('\n'.join(current_section))
+                current_section = []
+                current_length = 0
+
+    if current_section:
+        sections.append('\n'.join(current_section))
+
+    # Distribute frames across sections
+    frames_per_section = {}
+    if frames and sections:
+        for i, frame in enumerate(frames):
+            section_idx = int(i * len(sections) / len(frames))
+            if section_idx not in frames_per_section:
+                frames_per_section[section_idx] = frame
+
+    # Write sections with AI-generated summaries
+    emojis = ['🏷️', '💡', '🧠', '🍎', '🔑', '🔢', '🧱', '🎯', '✨', '🌟']
+
+    for i, section in enumerate(sections):
+        emoji = emojis[i % len(emojis)]
+
+        # Generate AI summary for this section
+        summary_data = _generate_section_summary(section, i+1)
+
+        f.write(f"## {emoji} {summary_data['title']}\n\n")
+
+        # Embed frame if available
+        if i in frames_per_section:
+            frame = frames_per_section[i]
+            f.write(f"![截图]({frame['path']})\n\n")
+            f.write(f"*时间戳: {frame['timestamp']}*\n\n")
+
+        # Write main content summary
+        f.write(f"**主要内容**：{summary_data['main_content']}\n\n")
+
+        # Write key points
+        f.write(f"**关键要点**：\n")
+        for point in summary_data['key_points']:
+            f.write(f"- {point}\n")
+        f.write(f"\n")
+
+        # Write important quotes if any
+        if summary_data['important_quotes']:
+            f.write(f"**重要语句**：\n")
+            for quote in summary_data['important_quotes']:
+                f.write(f"> {quote}\n\n")
+
+    # Add overall summary section
+    f.write(f"## 📝 总结\n\n")
+    overall_summary = _generate_overall_summary(subtitle_text, len(sections))
+    f.write(f"{overall_summary}\n\n")
+
+    # Add note about transcription source
+    f.write(f"---\n\n")
+    f.write(f"*注：本文档由 AI 自动生成，字幕通过语音识别技术提取，可能存在少量识别误差。*\n")
+
+
+def _write_bullet_summary(f, subtitle_text, frames, title, url):
+    """Write BibiGPT-style bullet point summary."""
+    f.write(f"# 🤖 {title} — AI 总结\n\n")
+
+    # Split into sections
+    lines = subtitle_text.split('\n')
+    sections = []
+    current_section = []
+
+    for line in lines:
+        current_section.append(line)
+        if len(current_section) >= 10:
+            sections.append(current_section)
+            current_section = []
+
+    if current_section:
+        sections.append(current_section)
+
+    # Distribute frames
+    frames_per_section = {}
+    if frames and sections:
+        for i, frame in enumerate(frames):
+            section_idx = int(i * len(sections) / len(frames))
+            if section_idx not in frames_per_section:
+                frames_per_section[section_idx] = frame
+
+    emojis = ['🏷️', '💡', '🧠', '🍎', '🔑', '🔢', '🧱', '🎯']
+
+    for i, section in enumerate(sections):
+        emoji = emojis[i % len(emojis)]
+        f.write(f"### {emoji} 要点 {i+1}\n")
+
+        if i in frames_per_section:
+            frame = frames_per_section[i]
+            f.write(f"![要点{i+1}]({frame['path']})\n")
+
+        for line in section[:5]:  # Max 5 lines per section
+            f.write(f"- {line}\n")
+        f.write(f"\n")
+
+    f.write(f"---\n\n")
+    f.write(f"*注：本总结由 AI 自动生成*\n")
+
+
+def _generate_section_summary(section_text, section_num):
+    """Generate AI summary for a section using Claude API."""
+    try:
+        # Try to import anthropic
+        try:
+            from anthropic import Anthropic
+        except ImportError:
+            log("anthropic package not installed. Run: pip install anthropic", "WARNING")
+            return _fallback_section_summary(section_text, section_num)
+
+        # Load config to get API key
+        config = _load_config()
+        api_key = config.get("anthropic_api_key", "")
+
+        if not api_key:
+            log("No Anthropic API key configured. Using fallback summary.", "WARNING")
+            return _fallback_section_summary(section_text, section_num)
+
+        client = Anthropic(api_key=api_key)
+
+        prompt = f"""分析以下视频字幕片段，生成结构化总结：
+
+字幕内容：
+{section_text}
+
+请以JSON格式返回，包含：
+1. title: 这部分的简短标题（5-10字）
+2. main_content: 主要内容概括（1-2句话，30-50字）
+3. key_points: 关键要点列表（3-5个要点，每个10-20字）
+4. important_quotes: 重要原文引用（0-2句，直接从字幕中提取）
+
+返回格式：
+{{
+  "title": "标题",
+  "main_content": "概括",
+  "key_points": ["要点1", "要点2", "要点3"],
+  "important_quotes": ["引用1", "引用2"]
+}}"""
+
+        message = client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        response_text = message.content[0].text.strip()
+
+        # Extract JSON from response (handle markdown code blocks)
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+
+        result = json.loads(response_text)
+        return result
+
+    except Exception as e:
+        log(f"AI summary failed: {e}", "WARNING")
+        return _fallback_section_summary(section_text, section_num)
+
+
+def _fallback_section_summary(section_text, section_num):
+    """Fallback summary when AI is not available."""
+    lines = [l.strip() for l in section_text.split('\n') if l.strip()]
+
+    # Extract sentences
+    sentences = []
+    for line in lines:
+        sentences.extend([s.strip() for s in re.split(r'[。！？.!?]', line) if s.strip()])
+
+    # Take first sentence as title
+    title = f"第 {section_num} 部分"
+    if sentences:
+        title_text = sentences[0][:15]
+        if len(sentences[0]) > 15:
+            title_text += "..."
+        title = title_text
+
+    # Main content: first 2-3 sentences
+    main_content = '。'.join(sentences[:2]) + '。' if len(sentences) >= 2 else (sentences[0] if sentences else "")
+
+    # Key points: longer sentences
+    key_points = [s for s in sentences if len(s) > 15][:4]
+    if not key_points:
+        key_points = sentences[:3]
+
+    # Important quotes: sentences with keywords
+    keywords = ['重要', '关键', '一定', '必须', '建议', '注意', '避免', '推荐']
+    important_quotes = [s for s in sentences if any(kw in s for kw in keywords)][:2]
+
+    return {
+        "title": title,
+        "main_content": main_content,
+        "key_points": key_points,
+        "important_quotes": important_quotes
+    }
+
+
+def _generate_overall_summary(subtitle_text, num_sections):
+    """Generate overall summary using Claude API."""
+    try:
+        try:
+            from anthropic import Anthropic
+        except ImportError:
+            return f"本视频共 {num_sections} 个部分，详细内容见上文各章节。"
+
+        config = _load_config()
+        api_key = config.get("anthropic_api_key", "")
+
+        if not api_key:
+            return f"本视频共 {num_sections} 个部分，详细内容见上文各章节。"
+
+        client = Anthropic(api_key=api_key)
+
+        # Truncate subtitle if too long
+        max_chars = 3000
+        truncated_text = subtitle_text[:max_chars]
+        if len(subtitle_text) > max_chars:
+            truncated_text += "..."
+
+        prompt = f"""请为以下视频字幕生成一个简洁的总结（100-150字），概括视频的主要内容和核心观点：
+
+{truncated_text}
+
+要求：
+1. 用1-2段话总结
+2. 突出核心主题和关键信息
+3. 语言简洁流畅"""
+
+        message = client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return message.content[0].text.strip()
+
+    except Exception as e:
+        log(f"Overall summary failed: {e}", "WARNING")
+        return f"本视频共 {num_sections} 个部分，详细内容见上文各章节。"
+
 
 
 if __name__ == "__main__":

@@ -1,16 +1,17 @@
 ---
 name: multi-video-summarizer
-description: "Summarize video/audio content from multiple platforms into structured notes with keyframe screenshots. Supports Bilibili (B站), YouTube, Douyin (抖音), Xiaohongshu (小红书), TikTok, and 1800+ sites via yt-dlp. Triggers on video URLs from any of these platforms, or Chinese requests like '总结视频', '视频笔记', '视频内容'. Detects URLs containing bilibili.com, youtube.com, youtu.be, douyin.com, xiaohongshu.com, tiktok.com, and more."
+description: "Summarize video/audio content from multiple platforms and local files into structured notes with keyframe screenshots. Supports Bilibili (B站), YouTube, Douyin (抖音), Xiaohongshu (小红书), TikTok, 1800+ sites via yt-dlp, and local video files. Triggers on video URLs from any of these platforms, local file paths (e.g., /path/to/video.mp4), or Chinese requests like '总结视频', '视频笔记', '视频内容'. Detects URLs containing bilibili.com, youtube.com, youtu.be, douyin.com, xiaohongshu.com, tiktok.com, and more."
 ---
 
 # Multi-Platform Video Summarizer
 
-Extract subtitles/transcripts from video platforms and generate structured notes. No login or cookies required.
+Extract subtitles/transcripts from video platforms and local files, then generate structured notes with SRT subtitle files. No login or cookies required.
 
-## Supported Platforms
+## Supported Sources
 
-| Platform | URL patterns | Extraction method |
+| Source | URL/Path patterns | Extraction method |
 |---|---|---|
+| **Local Files** | `/path/to/video.mp4`, `C:\videos\file.mp4` | ffmpeg + ASR (Whisper or Volcano Engine) |
 | Bilibili (B站) | `bilibili.com/video/`, `b23.tv/`, `BV*` | Public API (WBI signing) |
 | YouTube | `youtube.com/watch`, `youtu.be/`, `youtube.com/shorts/` | `youtube-transcript-api` |
 | Douyin (抖音) | `douyin.com/`, `v.douyin.com/` | `yt-dlp` |
@@ -42,14 +43,93 @@ pip install youtube-transcript-api
 pip install yt-dlp
 ```
 
-**Optional -- Whisper transcription** (for videos without subtitles):
-- OpenAI API mode: `pip install openai`
-- Local mode: `pip install faster-whisper`
-- Configure in `config.json` (see Whisper Setup below)
+**ASR (Automatic Speech Recognition) Options:**
+
+Choose one or both ASR engines:
+
+1. **Whisper** (OpenAI, offline capable):
+   - OpenAI API mode: `pip install openai`
+   - Local mode: `pip install faster-whisper`
+   - Configure in `config.json` (see Whisper Setup below)
+
+2. **Volcano Engine** (火山引擎, high-quality Chinese):
+   - No installation required (uses Python stdlib)
+   - Requires API credentials (see [VOLCENGINE.md](VOLCENGINE.md))
+   - Best for Chinese video transcription
 
 Only install what is needed. If the user provides a Bilibili URL, skip dependency installation entirely.
 
 ## Workflow
+
+### For Local Video Files
+
+**Prerequisites:**
+- ffmpeg must be installed (for audio extraction)
+- ASR engine must be configured in `config.json` (Whisper or Volcano Engine)
+
+**Steps:**
+
+1. **Configure ASR Engine**
+
+Choose your ASR engine in `config.json`:
+
+**Option A: Whisper (Local)**
+```json
+{
+    "asr_engine": "whisper",
+    "whisper_mode": "local",
+    "whisper_model": "medium",
+    "whisper_device": "cuda",
+    "whisper_compute_type": "float16",
+    "language": "zh",
+    "generate_srt": true,
+    "srt_output_dir": "subtitles"
+}
+```
+
+**Option B: Volcano Engine (火山引擎)**
+```json
+{
+    "asr_engine": "volcengine",
+    "volcengine_appid": "your_app_id",
+    "volcengine_token": "access_key:secret_key",
+    "volcengine_language": "zh-CN",
+    "generate_srt": true,
+    "srt_output_dir": "subtitles"
+}
+```
+
+**Option C: Auto (Try Volcano Engine first, fallback to Whisper)**
+```json
+{
+    "asr_engine": "auto",
+    "volcengine_appid": "your_app_id",
+    "volcengine_token": "access_key:secret_key",
+    "whisper_mode": "local",
+    "whisper_model": "medium",
+    "generate_srt": true
+}
+```
+
+2. **Extract and Transcribe**
+
+Run the script with the local file path:
+```bash
+python "<skill_path>/video_subtitle.py" "/path/to/video.mp4"
+```
+
+The script will:
+- Extract audio using ffmpeg
+- Transcribe with selected ASR engine
+- Generate SRT subtitle file (if enabled)
+- Extract keyframes if enabled
+- Output JSON with transcript and metadata
+
+3. **Generate Summary**
+
+Same as online videos - I will read the JSON output and generate structured notes.
+
+### For Online Videos
 
 ### Step 1: Install Dependencies (if needed)
 
@@ -169,32 +249,132 @@ Guidelines for summarization:
 - Generate 2 thought-provoking follow-up questions
 - Add 5 relevant hashtag topics at the end
 - If the source is "ai_conclusion", note that the summary comes from B站's built-in AI summary feature
-- If the source is "whisper_local" or "whisper_api", note that the transcript was generated via speech recognition and may contain minor inaccuracies
+- If the source is "whisper_local", "whisper_api", or "volcengine", note that the transcript was generated via speech recognition and may contain minor inaccuracies
 - **Keyframe images**: When frames are provided, embed them using `![title](absolute_path)` syntax. Each section should have at most one image, placed directly after the `### ` header line. Use the absolute `path` value from the frames array as-is
 
-## Whisper Setup (Optional)
+## ASR Engine Configuration
+
+### Whisper Setup
 
 For videos without subtitles, Whisper can transcribe the audio. Edit `config.json` in this skill's directory:
 
 **Option A -- OpenAI Whisper API** (fast, requires API key, costs ~$0.006/min):
 ```json
 {
+    "asr_engine": "whisper",
     "whisper_mode": "api",
     "openai_api_key": "sk-your-key-here",
-    "language": "zh"
+    "language": "zh",
+    "generate_srt": true
 }
 ```
 
 **Option B -- Local faster-whisper** (free, requires model download ~1-3GB):
 ```json
 {
+    "asr_engine": "whisper",
     "whisper_mode": "local",
-    "whisper_model": "base",
-    "language": "zh"
+    "whisper_model": "medium",
+    "whisper_device": "cuda",
+    "whisper_compute_type": "float16",
+    "language": "zh",
+    "generate_srt": true
 }
 ```
 
 Model sizes: `tiny` (fast, less accurate) / `base` (balanced) / `small` / `medium` / `large` (slow, most accurate).
+
+### Volcano Engine Setup (火山引擎)
+
+For high-quality Chinese transcription, use Volcano Engine ASR. See [VOLCENGINE.md](VOLCENGINE.md) for detailed setup instructions.
+
+**Quick setup:**
+```json
+{
+    "asr_engine": "volcengine",
+    "volcengine_appid": "your_app_id",
+    "volcengine_token": "access_key:secret_key",
+    "volcengine_language": "zh-CN",
+    "generate_srt": true,
+    "srt_output_dir": "subtitles"
+}
+```
+
+**Auto mode** (try Volcano Engine first, fallback to Whisper):
+```json
+{
+    "asr_engine": "auto",
+    "volcengine_appid": "your_app_id",
+    "volcengine_token": "access_key:secret_key",
+    "whisper_mode": "local",
+    "whisper_model": "medium",
+    "generate_srt": true
+}
+```
+
+### SRT Subtitle Generation
+
+When `generate_srt` is enabled, the script will automatically generate SRT subtitle files with timestamps:
+
+```json
+{
+    "generate_srt": true,
+    "srt_output_dir": "subtitles"
+}
+```
+
+- SRT files are saved to the `srt_output_dir` directory (relative to skill directory or absolute path)
+- Filename matches the video title (for online videos) or video filename (for local files)
+- Only works with ASR engines that return segment timestamps (Whisper local mode, Volcano Engine)
+- Whisper API mode does not support SRT generation (no timestamps)
+
+## Markdown Summary Generation
+
+When `generate_markdown` is enabled, the script will automatically generate a detailed Markdown summary file:
+
+```json
+{
+    "generate_markdown": true,
+    "markdown_output_dir": "summaries",
+    "markdown_style": "detailed",
+    "publish_dir": "D:\\Documents\\Code\\Video summarize"
+}
+```
+
+- `generate_markdown`: `true` to auto-generate .md files, `false` to skip (default: `false`)
+- `markdown_output_dir`: directory for saving summary files (default: `summaries`)
+- `markdown_style`: output style
+  - `"detailed"` - full paragraph descriptions with context and explanations (recommended)
+  - `"bullet"` - concise bullet points (BibiGPT style)
+- `publish_dir`: optional directory for publishing final summaries (default: none)
+
+### File Naming and Organization
+
+**For online videos:**
+- Markdown filename format: `YYYYMMDD-视频标题.md` (e.g., `20260417-婚礼化妆避坑建议.md`)
+- Files are saved directly to `publish_dir` if configured, otherwise to `markdown_output_dir`
+
+**For local video files:**
+- A subfolder is created using the video filename (without extension)
+- Markdown, SRT subtitles, and screenshots are all saved to this subfolder
+- Example structure:
+  ```
+  D:\Documents\Code\Video summarize\
+  └── 婚礼化妆避坑建议\
+      ├── 20260417-婚礼化妆避坑建议.md
+      ├── 婚礼化妆避坑建议.srt
+      └── screenshots\
+          ├── frame_001.jpg
+          ├── frame_002.jpg
+          └── ...
+  ```
+
+The generated Markdown file includes:
+- Video title and metadata
+- Detailed content summary with embedded keyframe screenshots
+- Section-by-section breakdown
+- Key highlights with hashtags
+- Thought-provoking questions
 
 ## Douyin / Xiaohongshu / TikTok Cookie Setup
 

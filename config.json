@@ -1,8 +1,26 @@
 {
-    "_comment": "Video Summarizer configuration. whisper_mode: 'disabled' | 'local' | 'api'. extract_frames: true to capture keyframes. cache_ttl_days: 0 = forever.",
+    "_comment": "Video Summarizer configuration. asr_engine: 'whisper' | 'volcengine' | 'auto'. whisper_mode: 'disabled' | 'local' | 'api'. extract_frames: true to capture keyframes. cache_ttl_days: 0 = forever.",
+
+    "asr_engine": "whisper",
+
     "whisper_mode": "local",
     "openai_api_key": "",
-    "whisper_model": "base",
+    "whisper_model": "medium",
+    "whisper_device": "cuda",
+    "whisper_compute_type": "float16",
+
+    "volcengine_appid": "",
+    "volcengine_token": "",
+    "volcengine_language": "zh-CN",
+
+    "generate_srt": true,
+    "srt_output_dir": "subtitles",
+
+    "generate_markdown": false,
+    "markdown_output_dir": "summaries",
+    "markdown_style": "detailed",
+    "publish_dir": "D:\\Documents\\Code\\Video summarize",
+
     "language": "zh",
     "extract_frames": true,
     "frames_per_video": 6,
