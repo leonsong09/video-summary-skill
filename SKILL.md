@@ -337,7 +337,7 @@ When `generate_markdown` is enabled, the script will automatically generate a de
     "generate_markdown": true,
     "markdown_output_dir": "summaries",
     "markdown_style": "detailed",
-    "publish_dir": "D:\\Documents\\Code\\Video summarize"
+    "publish_dir": ""
 }
 ```
 

@@ -19,7 +19,7 @@
     "generate_markdown": false,
     "markdown_output_dir": "summaries",
     "markdown_style": "detailed",
-    "publish_dir": "D:\\Documents\\Code\\Video summarize",
+    "publish_dir": "",
 
     "language": "zh",
     "extract_frames": true,
